@@ -10,12 +10,9 @@ run_dir=$1
 shift
 question=$*
 
-if [ -e "$run_dir" ]; then
-    echo "truthy-new: already exists: $run_dir" >&2
-    exit 1
-fi
-
-umask 022
+umask 077
+mkdir -p -- "$(dirname -- "$run_dir")"
+mkdir -- "$run_dir"
 mkdir -p "$run_dir/artifacts/sha256" \
          "$run_dir/model-runs" \
          "$run_dir/queue/model" \

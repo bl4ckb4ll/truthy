@@ -63,15 +63,19 @@ The body hash is the identity.  URL is metadata because the same URL can change 
 Each run records:
 
 ```text
-model-runs/<UTC>-<prompt-prefix>/
+model-runs/run-<opaque-id>/
   model-id.txt
   model-revision.txt
   command.txt
+  argv.nul
   prompt.txt
   stdout.txt
   stderr.txt
   hashes.tsv
   exit-status.txt
+  captured-utc.txt
 ```
 
-A model revision label is required even if it is only a local commit/model-store identifier.  The runner does not claim bit-for-bit determinism; it preserves enough information to inspect and compare the run.
+The runner requires nonempty, single-line model and revision labels. Each worker invocation gets an independent identity even when multiple invocations share the prompt, worker and second. `argv.nul` preserves the command and arguments byte for byte. `captured-utc.txt` records completion time.
+
+`truthy-model` stages its files privately on the investigation filesystem. It uses `flock` to serialize model capture publication and index writes. The completed record appears as one directory, and new model trace and edge entries refer to that directory by its relative path. A worker's nonzero exit and diagnostics are retained. An interrupted final index write can leave a completed record that requires reconciliation. Older timestamp-prefixed directories and their records are left in place.
