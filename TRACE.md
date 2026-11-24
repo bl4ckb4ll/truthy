@@ -54,9 +54,9 @@ Fetched bodies live at:
 artifacts/sha256/<sha256>/body
 ```
 
-Fetch observations live below `fetches/` so a later request never overwrites the metadata from an earlier request that happened to return the same body hash.
+Each fetch publishes its own private directory at `artifacts/sha256/<sha256>/fetches/observation-<opaque-id>`. A repeat at the same URL can add an observation to the same body without replacing either set of headers. `headers.txt` preserves the responses, including redirects. `curl-result.txt` retains raw HTTP status, effective URL, and content type on separate lines. `url.txt` records the requested URL and `stderr.txt` retains curl's diagnostics. `fetch.tsv` keeps its five columns for UTC, curl exit status, HTTP status, effective URL and content type. `body-state.txt` distinguishes a missing response body from a present empty body. The existing empty bytes convention for a missing body preserves the command's digest and artifact directory output.
 
-The body hash is the identity.  URL is metadata because the same URL can change and the same body can be obtained from multiple URLs.
+Fetch and model writers share one publication lock. Bodies are added by a no-replacement link, and a reused body must match its directory digest. The fetch trace identifies the observation by its relative path. The graph connects the requested URL to both its observation and artifact, with a separate observation-to-artifact edge.
 
 ## Model run identity
 

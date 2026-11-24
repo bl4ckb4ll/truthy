@@ -1,0 +1,122 @@
+"""Loopback-only regression for independent Truthy fetch observations."""
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from builtins import ValueError, dict, list, sorted
+
+arguments ∈ list[str] ← sys.argv
+repository ∈ str ← str(Path(arguments[1]).resolve())
+fixed_clock ∈ str ← """date() {
+  case "$2" in
+    +%Y%m%dT%H%M%SZ) printf '20261124T123456Z\\n' ;;
+    +%Y-%m-%dT%H:%M:%SZ) printf '2026-11-24T12:34:56Z\\n' ;;
+    *) return 1 ;;
+  esac
+}
+script=$1
+shift
+. "$script"
+"""
+
+def require(condition ∈ bool, case_name ∈ str) → None:
+    if not condition:
+        raise ValueError(case_name)
+
+def read_binary(path ∈ Path) → bytes:
+    data ∈ bytes ← path.read_bytes()
+    return data
+
+def read_text(path ∈ Path) → str:
+    data ∈ str ← path.read_text()
+    return data
+
+with tempfile.TemporaryDirectory(prefix="truthy-fetch-test-") as work:
+    root ∈ str ← str(work)
+    site ∈ Path ← Path(root + "/site")
+    site.mkdir()
+    document ∈ Path ← Path(str(site) + "/same.txt")
+    expected_body ∈ bytes ← b"Same response content.\n"
+    document.write_bytes(expected_body)
+    sha ∈ str ← hashlib.sha256(expected_body).hexdigest()
+    run ∈ str ← root + "/investigation"
+    subprocess.run(["/bin/sh", repository + "/bin/truthy-new", run, "fixture"], check=True, timeout=5)
+    server ∈ object ← subprocess.Popen([sys.executable, "-u", "-m", "http.server", "0", "--bind", "127.0.0.1", "--directory", str(site)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        startup ∈ list[str] ← str(server.stdout.readline().decode()).split(" port ")
+        address_fields ∈ list[str] ← startup[1].split(" ")
+        address ∈ str ← address_fields[0]
+        base ∈ str ← "http://127.0.0.1:" + address
+        url ∈ str ← base + "/same.txt"
+        command ∈ list[str] ← ["/bin/sh", "-c", fixed_clock, "truthy-fetch-fixture", repository + "/bin/truthy-fetch", run]
+        environment ∈ dict[str, str] ← dict(os.environ)
+        environment["NO_PROXY"] ← "127.0.0.1"
+        environment["no_proxy"] ← "127.0.0.1"
+        fetch ∈ list[str] ← list(command)
+        fetch.append(url)
+        os.utime(document, (1700000000, 1700000000))
+        first ∈ object ← subprocess.run(fetch, env=environment, capture_output=True, timeout=5, check=True)
+        os.utime(document, (1700086400, 1700086400))
+        second ∈ object ← subprocess.run(fetch, env=environment, capture_output=True, timeout=5, check=True)
+        bucket ∈ str ← run + "/artifacts/sha256/" + sha
+        expected_output ∈ bytes ← (sha + "\t" + bucket + "\n").encode()
+        first_stdout ∈ bytes ← first.stdout
+        second_stdout ∈ bytes ← second.stdout
+        require(first_stdout == expected_output and second_stdout == expected_output, "the fetch stdout contract changed")
+        body ∈ Path ← Path(bucket + "/body")
+        fetches ∈ Path ← Path(bucket + "/fetches")
+        trace_file ∈ Path ← Path(run + "/trace.tsv")
+        edge_file ∈ Path ← Path(run + "/edges.tsv")
+        require(read_binary(body) == expected_body, "stored body changed")
+
+        captures ∈ list[Path] ← sorted(fetches.iterdir())
+        require(len(captures) == 2, "same URL, body and second must retain two observations")
+        require(read_binary(Path(str(captures[0]) + "/headers.txt")) != read_binary(Path(str(captures[1]) + "/headers.txt")), "observations lost distinct headers")
+        for capture in captures:
+            expected_metadata ∈ str ← "2026-11-24T12:34:56Z\t0\t200\t" + url + "\ttext/plain\n"
+            require(read_text(Path(str(capture) + "/fetch.tsv")) == expected_metadata, "incorrect fetch status or response URL")
+            require(read_text(Path(str(capture) + "/body-state.txt")) == "present\n", "present response body lost")
+            key ∈ str ← str(capture.relative_to(run))
+            trace_count ∈ int ← read_text(trace_file).count("\tfetch\t" + key + "\t")
+            edge_count ∈ int ← read_text(edge_file).count("\tfetch-observation\t" + key + "\t")
+            require(trace_count == 1, "trace does not identify the observation")
+            require(edge_count == 1, "graph does not identify the observation")
+
+        left ∈ object ← subprocess.Popen(fetch, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        right ∈ object ← subprocess.Popen(fetch, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        left.communicate(timeout=5)
+        right.communicate(timeout=5)
+        left_status ∈ int ← left.returncode
+        right_status ∈ int ← right.returncode
+        require(left_status == 0 and right_status == 0, "concurrent fetch failed")
+        require(len(list(fetches.iterdir())) == 4, "concurrent observations collided")
+
+        command.append(base + "/missing.txt")
+        gone ∈ object ← subprocess.run(command, env=environment, capture_output=True, timeout=5)
+        gone_status ∈ int ← gone.returncode
+        gone_stderr ∈ bytes ← gone.stderr
+        require(gone_status == 22, "HTTP failure status was lost")
+        gone_fields ∈ list[str] ← str(gone.stdout.decode()).rstrip("\n").split("\t")
+        gone_bucket ∈ str ← gone_fields[1]
+        failed_captures ∈ list[Path] ← list(Path(gone_bucket + "/fetches").iterdir())
+        gone_capture ∈ str ← str(failed_captures[0])
+        require("\t22\t404\t" in read_text(Path(gone_capture + "/fetch.tsv")), "HTTP failure observation was lost")
+        require(len(read_binary(Path(gone_bucket + "/body"))) > 0, "HTTP error body was lost")
+        require(read_binary(Path(gone_capture + "/stderr.txt")) == gone_stderr, "curl diagnostics changed")
+
+        trace ∈ bytes ← trace_file.read_bytes()
+        edges ∈ bytes ← edge_file.read_bytes()
+        body.write_bytes(b"fixture corruption")
+        corrupted ∈ object ← subprocess.run(fetch, env=environment, capture_output=True, timeout=5)
+        corrupted_status ∈ int ← corrupted.returncode
+        corrupted_stderr ∈ bytes ← corrupted.stderr
+        require(corrupted_status != 0 and b"stored body does not match SHA-256" in corrupted_stderr, "corrupt stored body was accepted")
+        require(read_binary(body) == b"fixture corruption", "stored body was overwritten")
+        require(read_binary(trace_file) == trace and read_binary(edge_file) == edges, "corrupt body was indexed")
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+print("Truthy loopback fetch observations pass")

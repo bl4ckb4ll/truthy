@@ -94,7 +94,7 @@ printf 'prompt\t%s\nstdout\t%s\nstderr\t%s\n' \
         >> "$run_dir/trace.tsv"
     printf 'prompt\t%s\tanalyzed-by\tmodel-run\t%s\tmodel=%s revision=%s\n' \
         "$prompt_sha" "$run_key" "$model_id" "$model_revision" >> "$run_dir/edges.tsv"
-) 9>> "$run_dir/.model-capture.lock"
+) 9>> "$run_dir/.capture.lock"
 
 cat "$published/stdout.txt"
 exit "$status"

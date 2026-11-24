@@ -8,8 +8,9 @@ fi
 
 run_dir=$1
 url=$2
+body_store="$run_dir/artifacts/sha256"
 
-[ -f "$run_dir/trace.tsv" ] || {
+[ -f "$run_dir/trace.tsv" ] && [ -f "$run_dir/edges.tsv" ] && [ -d "$body_store" ] || {
     echo "truthy-fetch: not a Truthy run: $run_dir" >&2
     exit 1
 }
@@ -18,44 +19,91 @@ case "$url" in
     http://*|https://*) ;;
     *) echo "truthy-fetch: only http/https URLs are accepted" >&2; exit 2 ;;
 esac
+single_line() { printf '%s' "$1" | tr '\t\r\n' '   '; }
+if [ "$url" != "$(single_line "$url")" ]; then
+    echo 'truthy-fetch: URL must be a single-line field' >&2
+    exit 2
+fi
+command -v flock >/dev/null 2>&1 || {
+    echo 'truthy-fetch: flock is required to publish captures' >&2
+    exit 1
+}
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/truthy-fetch.XXXXXX")
-trap 'rm -rf "$work"' EXIT HUP INT TERM
+hash_file() {
+    hash=$(sha256sum < "$1") || return
+    printf '%s\n' "${hash%% *}"
+}
+
+umask 077
+work=$(mktemp -d -- "$body_store/.pending.XXXXXXXXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+staged="$work/observation"
+mkdir -- "$staged"
+: > "$staged/headers.txt"
 
 set +e
 curl --silent --show-error --location --max-redirs 8 \
      --connect-timeout 20 --max-time 120 --fail-with-body \
-     --dump-header "$work/headers" \
+     --dump-header "$staged/headers.txt" \
      --output "$work/body" \
-     --write-out '%{http_code}\t%{url_effective}\t%{content_type}\n' \
-     "$url" > "$work/result"
+     --write-out '%{http_code}\n%{url_effective}\n%{content_type}\n' \
+     -- "$url" > "$staged/curl-result.txt" 2> "$staged/stderr.txt"
 status=$?
 set -e
 
-[ -f "$work/body" ] || : > "$work/body"
-sha=$(sha256sum "$work/body" | awk '{print $1}')
-dest="$run_dir/artifacts/sha256/$sha"
-mkdir -p "$dest/fetches"
-
-if [ ! -f "$dest/body" ]; then
-    mv "$work/body" "$dest/body"
+body_state=present
+if [ ! -f "$work/body" ]; then
+    body_state=missing
+    : > "$work/body"
 fi
-
-utc_file=$(date -u '+%Y%m%dT%H%M%SZ')
+sha=$(hash_file "$work/body")
+dest="$body_store/$sha"
+observation_key="artifacts/sha256/$sha/fetches/observation-${work##*.}"
+published="$run_dir/$observation_key"
 utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-url_sha=$(printf '%s' "$url" | sha256sum | awk '{print $1}')
-obs="$dest/fetches/$utc_file-$(printf '%.12s' "$url_sha")"
-mkdir -p "$obs"
-cp "$work/headers" "$obs/headers.txt"
-printf '%s\n' "$url" > "$obs/url.txt"
-printf '%s\t%s\t' "$utc" "$status" > "$obs/fetch.tsv"
-cat "$work/result" >> "$obs/fetch.tsv"
+{
+    IFS= read -r http_status || http_status=000
+    IFS= read -r effective_url || effective_url=
+    IFS= read -r content_type || content_type=
+} < "$staged/curl-result.txt"
+printf '%s\n' "$url" > "$staged/url.txt"
+printf '%s\n' "$body_state" > "$staged/body-state.txt"
+printf '%s\t%s\t%s\t%s\t%s\n' "$utc" "$status" "$(single_line "$http_status")" \
+    "$(single_line "$effective_url")" "$(single_line "$content_type")" > "$staged/fetch.tsv"
 
-result=$(tr '\t\r\n' '   ' < "$work/result")
-printf '%s\tfetch\t%s\turl=%s status=%s %s\n' \
-    "$utc" "$sha" "$url" "$status" "$result" >> "$run_dir/trace.tsv"
-printf 'url\t%s\tfetched-as\tartifact\t%s\tstatus=%s\n' \
-    "$url" "$sha" "$status" >> "$run_dir/edges.tsv"
+(
+    flock -x 9
+    if [ -L "$dest" ] || [ -L "$dest/fetches" ]; then
+        echo "truthy-fetch: invalid artifact directory: $dest" >&2
+        exit 1
+    fi
+    if [ -e "$published" ] || [ -L "$published" ]; then
+        echo "truthy-fetch: observation id already exists: $observation_key" >&2
+        exit 1
+    fi
+    mkdir -p -- "$dest"
+    if [ -e "$dest/body" ] || [ -L "$dest/body" ]; then
+        if [ -L "$dest/body" ] || [ ! -f "$dest/body" ] || [ "$(hash_file "$dest/body")" != "$sha" ]; then
+            echo "truthy-fetch: stored body does not match SHA-256: $sha" >&2
+            exit 1
+        fi
+    else
+        ln -T -- "$work/body" "$dest/body"
+    fi
+    mkdir -p -- "$dest/fetches"
+    mv -- "$staged" "$published"
+    printf '%s\tfetch\t%s\turl=%s status=%s artifact=%s\n' \
+        "$utc" "$observation_key" "$url" "$status" "$sha" >> "$run_dir/trace.tsv"
+    {
+        printf 'url\t%s\tfetched-as\tartifact\t%s\tstatus=%s\n' "$url" "$sha" "$status"
+        printf 'url\t%s\tobserved-as\tfetch-observation\t%s\tstatus=%s\n' "$url" "$observation_key" "$status"
+        printf 'fetch-observation\t%s\tbody\tartifact\t%s\t%s\n' "$observation_key" "$sha" "$body_state"
+    } >> "$run_dir/edges.tsv"
+) 9>> "$run_dir/.capture.lock"
 
+cat "$published/stderr.txt" >&2
 printf '%s\t%s\n' "$sha" "$dest"
 exit "$status"
