@@ -21,48 +21,80 @@ shift
     exit 2
 }
 
-[ -f "$run_dir/trace.tsv" ] || {
+[ -f "$run_dir/trace.tsv" ] && [ -f "$run_dir/edges.tsv" ] && [ -d "$run_dir/model-runs" ] || {
     echo "truthy-model: not a Truthy run: $run_dir" >&2
     exit 1
 }
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/truthy-model.XXXXXX")
-trap 'rm -rf "$work"' EXIT HUP INT TERM
-cat > "$work/prompt.txt"
-prompt_sha=$(sha256sum "$work/prompt.txt" | awk '{print $1}')
-utc_file=$(date -u '+%Y%m%dT%H%M%SZ')
-utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-run="$run_dir/model-runs/$utc_file-$(printf '%.12s' "$prompt_sha")"
-mkdir -p "$run"
+single_line() { printf '%s' "$1" | tr '\t\r\n' '   '; }
+for label in "$model_id" "$model_revision"; do
+    if [ -z "$label" ] || [ "$label" != "$(single_line "$label")" ]; then
+        echo 'truthy-model: model id and revision must be nonempty single-line fields' >&2
+        exit 2
+    fi
+done
+command -v flock >/dev/null 2>&1 || {
+    echo 'truthy-model: flock is required to publish captures' >&2
+    exit 1
+}
 
-cp "$work/prompt.txt" "$run/prompt.txt"
-printf '%s\n' "$model_id" > "$run/model-id.txt"
-printf '%s\n' "$model_revision" > "$run/model-revision.txt"
+hash_file() {
+    hash=$(sha256sum < "$1") || return
+    printf '%s\n' "${hash%% *}"
+}
+
+umask 077
+reservation=$(mktemp -d -- "$run_dir/model-runs/.pending.XXXXXXXXXXXX")
+trap 'rm -rf -- "$reservation"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+staged="$reservation/capture"
+mkdir -- "$staged"
+run_key="model-runs/run-${reservation##*.}"
+published="$run_dir/$run_key"
+
+cat > "$staged/prompt.txt"
+printf '%s\n' "$model_id" > "$staged/model-id.txt"
+printf '%s\n' "$model_revision" > "$staged/model-revision.txt"
+printf '%s\0' "$@" > "$staged/argv.nul"
 cmd=$1
 shift
-printf '%s\n' "$cmd" > "$run/command.txt"
-printf '%s\0' "$cmd" "$@" > "$run/argv.nul"
-for arg in "$@"; do
-    printf 'arg\t%s\n' "$(printf '%s' "$arg" | tr '\t\r\n' '   ')" >> "$run/command.txt"
-done
-set -- "$cmd" "$@"
+{
+    printf '%s\n' "$(single_line "$cmd")"
+    for arg in "$@"; do
+        printf 'arg\t%s\n' "$(single_line "$arg")"
+    done
+} > "$staged/command.txt"
 
 set +e
-"$@" < "$run/prompt.txt" > "$run/stdout.txt" 2> "$run/stderr.txt"
+"$cmd" "$@" < "$staged/prompt.txt" > "$staged/stdout.txt" 2> "$staged/stderr.txt"
 status=$?
 set -e
-printf '%s\n' "$status" > "$run/exit-status.txt"
+printf '%s\n' "$status" > "$staged/exit-status.txt"
+utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+printf '%s\n' "$utc" > "$staged/captured-utc.txt"
 
-stdout_sha=$(sha256sum "$run/stdout.txt" | awk '{print $1}')
-stderr_sha=$(sha256sum "$run/stderr.txt" | awk '{print $1}')
+prompt_sha=$(hash_file "$staged/prompt.txt")
+stdout_sha=$(hash_file "$staged/stdout.txt")
+stderr_sha=$(hash_file "$staged/stderr.txt")
 printf 'prompt\t%s\nstdout\t%s\nstderr\t%s\n' \
-    "$prompt_sha" "$stdout_sha" "$stderr_sha" > "$run/hashes.tsv"
+    "$prompt_sha" "$stdout_sha" "$stderr_sha" > "$staged/hashes.tsv"
 
-printf '%s\tmodel\t%s\tmodel=%s revision=%s prompt=%s stdout=%s exit=%s\n' \
-    "$utc" "$run" "$model_id" "$model_revision" "$prompt_sha" "$stdout_sha" "$status" \
-    >> "$run_dir/trace.tsv"
-printf 'prompt\t%s\tanalyzed-by\tmodel-run\t%s\tmodel=%s revision=%s\n' \
-    "$prompt_sha" "$run" "$model_id" "$model_revision" >> "$run_dir/edges.tsv"
+(
+    flock -x 9
+    if [ -e "$published" ] || [ -L "$published" ]; then
+        echo "truthy-model: capture id already exists: $run_key" >&2
+        exit 1
+    fi
+    # Both paths are under model-runs, so publication is a directory rename.
+    mv -- "$staged" "$published"
+    printf '%s\tmodel\t%s\tmodel=%s revision=%s prompt=%s stdout=%s exit=%s\n' \
+        "$utc" "$run_key" "$model_id" "$model_revision" "$prompt_sha" "$stdout_sha" "$status" \
+        >> "$run_dir/trace.tsv"
+    printf 'prompt\t%s\tanalyzed-by\tmodel-run\t%s\tmodel=%s revision=%s\n' \
+        "$prompt_sha" "$run_key" "$model_id" "$model_revision" >> "$run_dir/edges.tsv"
+) 9>> "$run_dir/.model-capture.lock"
 
-cat "$run/stdout.txt"
+cat "$published/stdout.txt"
 exit "$status"
