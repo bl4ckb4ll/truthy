@@ -16,6 +16,49 @@ printf '%s\n' \
 python3 "$root/bin/truthy-links.py" "$root/tests/fixtures/page.html" 'https://example.org/start' > "$actual"
 cmp "$expected" "$actual"
 
+fixture="$root/tests/fixtures/page.html"
+link_run="$work/run"
+checksum=$(sha256sum < "$fixture")
+digest=${checksum%% *}
+bucket="$link_run/artifacts/sha256/$digest"
+mkdir "$bucket"
+cp "$fixture" "$bucket/body"
+
+attach_links() {
+    python3 "$root/bin/truthy-links.py" "$1" 'https://example.org/start' \
+        --run "$link_run" --artifact-hash "$digest"
+}
+
+attach_links "$fixture" > "$actual"
+cmp "$expected" "$actual"
+for link in 'https://example.org/alpha' 'https://example.org/beta'; do
+    edge=$(printf 'artifact\t%s\tlinks-to\turl\t%s\t' "$digest" "$link")
+    grep -Fx "$edge" "$link_run/edges.tsv" >/dev/null
+done
+trace_entry=$(printf '\tlinks\t%s\tcount=2 base=https://example.org/start' "$digest")
+grep -F "$trace_entry" "$link_run/trace.tsv" >/dev/null
+
+cp "$link_run/edges.tsv" "$work/link-edges.before"
+cp "$link_run/trace.tsv" "$work/link-trace.before"
+
+require_link_rejection() {
+    if attach_links "$1" > "$actual" 2> "$work/link-error"; then
+        echo "truthy smoke: unexpectedly accepted $2" >&2
+        exit 1
+    fi
+    test ! -s "$actual"
+    grep -F "$2" "$work/link-error" >/dev/null
+    cmp "$work/link-edges.before" "$link_run/edges.tsv"
+    cmp "$work/link-trace.before" "$link_run/trace.tsv"
+}
+
+printf '<p>Other fixture bytes</p>\n' > "$work/other.html"
+require_link_rejection "$work/other.html" 'input BODY does not match --artifact-hash'
+cp "$work/other.html" "$bucket/body"
+require_link_rejection "$fixture" 'stored artifact body does not match SHA-256'
+rm "$bucket/body"
+require_link_rejection "$fixture" 'stored artifact body is missing or invalid'
+
 printf 'prompt body\n' | sh "$root/bin/truthy-model" "$work/run" fixture-model fixture-rev -- cat > "$work/model.out"
 printf 'prompt body\n' > "$work/model.expected"
 cmp "$work/model.expected" "$work/model.out"

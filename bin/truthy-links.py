@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import os
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urldefrag, urljoin, urlparse
@@ -38,11 +41,22 @@ def main() -> int:
     p.add_argument("--artifact-hash", help="hash corresponding to BODY when --run is used")
     args = p.parse_args()
 
-    if bool(args.run) != bool(args.artifact_hash):
+    if (args.run is None) != (args.artifact_hash is None):
         p.error("--run and --artifact-hash must be supplied together")
 
+    artifact_hash = None
+    if args.artifact_hash is not None:
+        artifact_hash = args.artifact_hash.lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", artifact_hash):
+            p.error("--artifact-hash must be a 64-digit SHA-256 digest")
+
+    body = args.body.read_bytes()
+    if artifact_hash is not None and hashlib.sha256(body).hexdigest() != artifact_hash:
+        p.error("input BODY does not match --artifact-hash")
+
     parser = LinkParser()
-    parser.feed(args.body.read_text(encoding="utf-8", errors="replace"))
+    html = body.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    parser.feed(html)
 
     base = urlparse(args.base_url)
     out: set[str] = set()
@@ -59,23 +73,43 @@ def main() -> int:
     if args.max > 0:
         links = links[: args.max]
 
-    if args.run:
+    if artifact_hash is not None:
+        import fcntl
+
         edges = args.run / "edges.tsv"
         trace = args.run / "trace.tsv"
-        if not edges.exists() or not trace.exists():
+        if not edges.is_file() or not trace.is_file():
             p.error(f"not a Truthy run: {args.run}")
-        with edges.open("a", encoding="utf-8") as f:
-            for link in links:
-                f.write(
-                    f"artifact\t{clean_tsv(args.artifact_hash)}\tlinks-to\turl\t"
-                    f"{clean_tsv(link)}\t\n"
+        canonical = args.run / "artifacts" / "sha256" / artifact_hash / "body"
+        lock_fd = os.open(args.run / ".capture.lock", os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(lock_fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if (
+                canonical.is_symlink()
+                or canonical.parent.is_symlink()
+                or not canonical.is_file()
+            ):
+                p.error(f"stored artifact body is missing or invalid: {canonical}")
+            digest = hashlib.sha256()
+            try:
+                with canonical.open("rb") as source:
+                    for chunk in iter(lambda: source.read(64 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as error:
+                p.error(f"cannot read stored artifact body: {error}")
+            if digest.hexdigest() != artifact_hash:
+                p.error(f"stored artifact body does not match SHA-256: {canonical}")
+
+            with edges.open("a", encoding="utf-8") as edge_file, trace.open("a", encoding="utf-8") as trace_file:
+                for link in links:
+                    edge_file.write(
+                        f"artifact\t{artifact_hash}\tlinks-to\turl\t{clean_tsv(link)}\t\n"
+                    )
+                utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                trace_file.write(
+                    f"{utc}\tlinks\t{artifact_hash}\t"
+                    f"count={len(links)} base={clean_tsv(args.base_url)}\n"
                 )
-        utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with trace.open("a", encoding="utf-8") as f:
-            f.write(
-                f"{utc}\tlinks\t{clean_tsv(args.artifact_hash)}\t"
-                f"count={len(links)} base={clean_tsv(args.base_url)}\n"
-            )
 
     for link in links:
         print(link)
