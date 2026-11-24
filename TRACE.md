@@ -58,6 +58,8 @@ Each fetch publishes its own private directory at `artifacts/sha256/<sha256>/fet
 
 Fetch and model writers share one publication lock. Bodies are added by a no-replacement link, and a reused body must match its directory digest. The fetch trace identifies the observation by its relative path. The graph connects the requested URL to both its observation and artifact, with a separate observation-to-artifact edge.
 
+When `truthy-links.py` attaches links to a run, both the input bytes and the stored body must match the supplied SHA-256 digest. The parser reads the verified input buffer. The stored digest is checked under the capture lock before link edges or trace rows are appended. Standalone extraction uses the supplied input file directly.
+
 ## Model run identity
 
 Each run records:
